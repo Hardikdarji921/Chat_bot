@@ -9,7 +9,18 @@ from duckduckgo_search import DDGS
 
 # ─── Configuration ───────────────────────────────────────
 CONFIG_FILE = 'config.json'
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+MODEL = os.getenv("MODEL", "meta/llama3-70b-instruct")   # fallback default
 
+if not TELEGRAM_TOKEN:
+    logger.error("TELEGRAM_TOKEN environment variable is missing")
+    exit(1)   # or raise exception
+
+if not NVIDIA_API_KEY:
+    logger.error("NVIDIA_API_KEY environment variable is missing")
+    exit(1)
+    
 SUPABASE_URL = "https://phonjftgqkutfeigdrts.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBob25qZnRncWt1dGZlaWdkcnRzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE4Mjg5OTAsImV4cCI6MjA4NzQwNDk5MH0.w4ZHZEQXaYHCDMraFRsnRRM1WAfKRhXm25YwB6g33XM"
 
@@ -177,8 +188,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     config = get_config()
-    api_key = config.get('api_key')
-    model = config.get('model', 'meta/llama3-70b-instruct')
+    api_key = NVIDIA_API_KEY
+    model = MODEL
 
     if not api_key:
         await update.message.reply_text("❌ API key not set.")
