@@ -10,23 +10,27 @@ from supabase import create_client, Client
 from duckduckgo_search import DDGS
 
 # ─── Configuration ───────────────────────────────────────
+# File where Telegram token and NVIDIA API key are stored
 CONFIG_FILE = 'config.json'
+# Name of the Telegram bot script to start/stop
 BOT_SCRIPT = 'telegram_bot.py'
 
-# Main app password (already existed)
-APP_PASSWORD_HASH = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"  # "password"
+# Main login password hash (for the Streamlit app dashboard)
+APP_PASSWORD_HASH = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"  # hash of "password"
 
-# NEW: Separate admin password to unlock sensitive settings
-# Change this to something strong and keep it secret
-ADMIN_PASSWORD_PLAIN = "Hardik@123"  # ← CHANGE THIS
+# Separate admin password hash to protect sensitive settings
+ADMIN_PASSWORD_PLAIN = "Hardik@123"  # ← CHANGE THIS TO A STRONG PASSWORD
 ADMIN_PASSWORD_HASH = hashlib.sha256(ADMIN_PASSWORD_PLAIN.encode()).hexdigest()
 
+# Supabase connection details (public anon key - safe for client-side)
 SUPABASE_URL = "https://phonjftgqkutfeigdrts.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBob25qZnRncWt1dGZlaWdkcnRzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE4Mjg5OTAsImV4cCI6MjA4NzQwNDk5MH0.w4ZHZEQXaYHCDMraFRsnRRM1WAfKRhXm25YwB6g33XM"
 
+# Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ─── Page Config ─────────────────────────────────────────
+# Set global Streamlit page settings
 st.set_page_config(
     page_title="NVIDIA AI Chat v5.2",
     page_icon="🤖",
@@ -34,7 +38,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ─── Supabase Helpers ────────────────────────────────────
+# ─── Supabase Helper Functions ───────────────────────────
+# Get or create user record based on username
 def get_or_create_user(username: str, telegram_id=None):
     resp = supabase.table("users").select("id").eq("username", username).execute()
     if resp.data:
@@ -48,6 +53,7 @@ def get_or_create_user(username: str, telegram_id=None):
     resp = supabase.table("users").insert(data).execute()
     return resp.data[0]["id"]
 
+# Fetch all sessions for a given user, sorted newest first
 def get_sessions(user_id: int):
     resp = supabase.table("sessions") \
         .select("id, title, created_at, system_prompt, persona_name") \
@@ -56,6 +62,7 @@ def get_sessions(user_id: int):
         .execute()
     return resp.data
 
+# Create a new chat session for the user
 def create_session(user_id: int, title="New Chat"):
     data = {
         "user_id": user_id,
@@ -66,6 +73,7 @@ def create_session(user_id: int, title="New Chat"):
     resp = supabase.table("sessions").insert(data).execute()
     return resp.data[0]["id"]
 
+# Load all messages for a specific session
 def load_messages(session_id: int):
     resp = supabase.table("messages") \
         .select("id, role, content, timestamp") \
@@ -74,6 +82,7 @@ def load_messages(session_id: int):
         .execute()
     return resp.data
 
+# Save a new message (user or assistant) to the database
 def save_message(session_id: int, role: str, content: str):
     supabase.table("messages").insert({
         "session_id": session_id,
@@ -81,34 +90,43 @@ def save_message(session_id: int, role: str, content: str):
         "content": content
     }).execute()
 
+# Update the content of an existing message
 def update_message(msg_id: int, new_content: str):
     supabase.table("messages").update({"content": new_content}).eq("id", msg_id).execute()
 
+# Delete a single message
 def delete_message(msg_id: int):
     supabase.table("messages").delete().eq("id", msg_id).execute()
 
+# Delete all messages after a certain point (used after editing)
 def truncate_messages(session_id: int, msg_id: int):
     supabase.table("messages").delete() \
         .eq("session_id", session_id) \
         .gt("id", msg_id) \
         .execute()
 
+# Update the system prompt of a session
 def update_session_prompt(session_id: int, prompt: str):
     supabase.table("sessions").update({"system_prompt": prompt}).eq("id", session_id).execute()
 
+# Update the display title of a session
 def update_session_title(session_id: int, title: str):
     supabase.table("sessions").update({"title": title}).eq("id", session_id).execute()
 
+# Delete an entire session (messages are deleted via cascade or manually)
 def delete_session(session_id: int):
     supabase.table("sessions").delete().eq("id", session_id).execute()
 
+# Get only the system prompt of a session
 def get_session_prompt(session_id: int):
     resp = supabase.table("sessions").select("system_prompt").eq("id", session_id).execute()
     return resp.data[0]["system_prompt"] if resp.data else "You are a helpful assistant."
 
+# Clear all messages in the current session
 def clear_current_session(session_id: int):
     supabase.table("messages").delete().eq("session_id", session_id).execute()
 
+# Send chat completion request to NVIDIA API
 def send_to_nvidia(api_key, model, messages):
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -120,6 +138,7 @@ def send_to_nvidia(api_key, model, messages):
     usage = data.get('usage', {})
     return content, usage
 
+# Check if telegram_bot.py process is currently running
 def check_bot_status():
     try:
         result = subprocess.run(['pgrep', '-f', 'telegram_bot.py'], capture_output=True, text=True)
@@ -127,9 +146,11 @@ def check_bot_status():
     except:
         return False
 
+# Start the Telegram bot in a new process
 def start_bot():
     subprocess.Popen(['python', BOT_SCRIPT], start_new_session=True)
 
+# Gracefully stop the Telegram bot process
 def stop_bot():
     try:
         result = subprocess.run(['pgrep', '-f', 'telegram_bot.py'], capture_output=True, text=True)
@@ -140,24 +161,65 @@ def stop_bot():
     except:
         pass
 
-def trigger_ai_response(session_id, api_key, model, system_prompt):
-    messages = load_messages(session_id)
-    api_messages = [{"role": "system", "content": system_prompt}]
-    for m in messages:
-        if m["role"] in ['user', 'assistant']:
-            api_messages.append({"role": m["role"], "content": m["content"]})
+# ─── Auto-title generation functions ─────────────────────
 
-    if not messages or messages[-1]["role"] != 'user':
-        return False, None
+def auto_generate_simple_title(session_id: int):
+    """Simple version: use first user message (zero cost)"""
+    messages = load_messages(session_id)
+    if not messages:
+        return None
+
+    first_user_msg = next(
+        (m['content'].strip() for m in messages if m['role'] == 'user'),
+        None
+    )
+
+    if not first_user_msg:
+        return None
+
+    title = first_user_msg.replace("\n", " ").strip()
+    if len(title) > 60:
+        title = title[:57] + "..."
+
+    if title:
+        update_session_title(session_id, title[:70])
+        return title
+    return None
+
+
+def auto_generate_llm_title(session_id: int, api_key: str, model: str):
+    """Better version: ask LLM to summarize (after some messages)"""
+    messages = load_messages(session_id)
+    if len(messages) < 4:
+        return None
+
+    recent = messages[-6:]
+    context = "\n".join([f"{m['role']}: {m['content'][:150]}" for m in recent])
+
+    prompt_messages = [
+        {
+            "role": "system",
+            "content": "Create a very short, clear session title (4–8 words max). "
+                       "Focus on the main topic. No quotes, no explanations, no punctuation at the end."
+        },
+        {
+            "role": "user",
+            "content": f"Summarize this conversation into a short title:\n\n{context}"
+        }
+    ]
 
     try:
-        response, usage = send_to_nvidia(api_key, model, api_messages)
-        save_message(session_id, 'assistant', response)
-        return True, (response, usage)
-    except Exception as e:
-        return False, str(e)
+        title_raw, _ = send_to_nvidia(api_key, model, prompt_messages)
+        title = title_raw.strip().strip('"').strip("'").strip()
+        words = title.split()
+        if 3 <= len(words) <= 10 and len(title) <= 70:
+            update_session_title(session_id, title)
+            return title
+    except Exception:
+        pass
+    return None
 
-# ─── Login ───────────────────────────────────────────────
+# ─── Login Screen ────────────────────────────────────────
 def login_screen():
     st.title("🔒 Login")
     password = st.text_input("Password", type="password")
@@ -168,7 +230,7 @@ def login_screen():
         else:
             st.error("Wrong password")
 
-# ─── Config Helpers ──────────────────────────────────────
+# ─── Config File Helpers ─────────────────────────────────
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -179,17 +241,17 @@ def save_config(cfg):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(cfg, f)
 
-# ─── Main App ────────────────────────────────────────────
+# ─── Main Application ────────────────────────────────────
 def main_app():
     with st.sidebar:
         st.title("⚙️ Controls")
 
-        # Profile
+        # Profile section – select or create user
         st.subheader("👤 Profile")
         username = st.text_input("Username", value="hardik")
         if st.button("Set User"):
             st.session_state['user_id'] = get_or_create_user(username)
-            # Reset current session when changing user
+            # Reset current session when user changes
             if 'current_session' in st.session_state:
                 del st.session_state['current_session']
             st.success(f"User set to: {username}")
@@ -243,7 +305,7 @@ def main_app():
 
                 st.divider()
 
-                # NVIDIA API – only visible after correct admin password
+                # NVIDIA API key management – protected
                 st.subheader("🔑 NVIDIA API")
                 api_key_input = st.text_input(
                     "NVIDIA API Key",
@@ -263,7 +325,7 @@ def main_app():
 
         st.divider()
 
-        # Model selection – left visible (not sensitive)
+        # Model selection (visible to all logged-in users)
         config = load_config()
         model = st.selectbox("Model", [
             "meta/llama3-70b-instruct",
@@ -272,7 +334,7 @@ def main_app():
             "google/gemma-7b-it"
         ], index=0)
 
-        # Personas
+        # Persona selection – changes system prompt
         st.subheader("🎭 Persona")
         personas = {
             "Default Assistant": "You are a helpful, concise and friendly assistant.",
@@ -294,7 +356,7 @@ def main_app():
 
         st.divider()
 
-        # Sessions – improved listing
+        # Sessions management – list, create, load, delete
         st.subheader("📁 Your Sessions")
 
         if st.button("➕ New Session"):
@@ -308,14 +370,14 @@ def main_app():
 
         if sessions:
             for s in sessions:
-                title = s['title'] or f"Chat {s['created_at'][:16]}"
+                title = s['title'] or f"Chat {s['created_at'][:16].replace('T', ' ')}"
                 is_active = 'current_session' in st.session_state and st.session_state['current_session'] == s['id']
 
-                cols = st.columns([6, 1])
+                cols = st.columns([7, 1])
                 with cols[0]:
                     if st.button(
                         f"{'→ ' if is_active else ''}{title}",
-                        key=f"session_load_{s['id']}",
+                        key=f"load_session_{s['id']}",
                         use_container_width=True,
                         type="primary" if is_active else "secondary"
                     ):
@@ -325,7 +387,7 @@ def main_app():
                         st.rerun()
 
                 with cols[1]:
-                    if st.button("🗑", key=f"session_del_{s['id']}"):
+                    if st.button("🗑", key=f"delete_session_{s['id']}"):
                         delete_session(s['id'])
                         if 'current_session' in st.session_state and st.session_state['current_session'] == s['id']:
                             del st.session_state['current_session']
@@ -338,9 +400,10 @@ def main_app():
                 st.success("Chat cleared")
                 st.rerun()
 
-    # ─── Main Area ───────────────────────────────────────────
+    # ─── Main Chat Area ──────────────────────────────────────
     st.title("🤖 NVIDIA AI Chat")
 
+    # Initialize new session if none exists
     if 'current_session' not in st.session_state:
         st.session_state['current_session'] = create_session(st.session_state['user_id'])
         st.session_state['messages'] = []
@@ -352,22 +415,22 @@ def main_app():
     if 'system_prompt' not in st.session_state:
         st.session_state['system_prompt'] = get_session_prompt(st.session_state['current_session'])
 
-    # System prompt view/edit
-    with st.expander("System Prompt"):
+    # System prompt editor
+    with st.expander("System Prompt (edit if needed)"):
         prompt_edit = st.text_area("Prompt", value=st.session_state['system_prompt'], height=120)
         if st.button("Update Prompt"):
             update_session_prompt(st.session_state['current_session'], prompt_edit)
             st.session_state['system_prompt'] = prompt_edit
-            st.success("Updated")
+            st.success("System prompt updated")
             st.rerun()
 
-    # Messages
+    # Display chat history
     for msg in st.session_state['messages']:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             st.caption(str(msg["timestamp"]))
 
-    # Input
+    # Chat input + response generation
     if prompt := st.chat_input("Message..."):
         if not config.get('api_key'):
             st.error("NVIDIA API key not set (admin section)")
@@ -377,6 +440,13 @@ def main_app():
 
             save_message(st.session_state['current_session'], 'user', prompt)
             st.session_state['messages'] = load_messages(st.session_state['current_session'])
+
+            # ── Simple title after FIRST user message ──
+            if len(st.session_state['messages']) == 1:
+                simple_title = auto_generate_simple_title(st.session_state['current_session'])
+                if simple_title:
+                    st.toast(f"Session titled: {simple_title}", icon="✨")
+                    st.session_state['messages'] = load_messages(st.session_state['current_session'])  # refresh
 
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
@@ -390,7 +460,17 @@ def main_app():
                         st.markdown(response)
 
                         save_message(st.session_state['current_session'], 'assistant', response)
-                        st.session_state['messages'] = load_messages(st.session_state['current_session'])
+
+                        # ── LLM-based better title after assistant reply ──
+                        if len(st.session_state['messages']) >= 4 and config.get('api_key'):
+                            llm_title = auto_generate_llm_title(
+                                st.session_state['current_session'],
+                                config['api_key'],
+                                model
+                            )
+                            if llm_title:
+                                st.toast(f"Improved title: {llm_title}", icon="✨")
+                                st.session_state['messages'] = load_messages(st.session_state['current_session'])
 
                         if usage:
                             pt = usage.get('prompt_tokens', '?')
@@ -401,9 +481,10 @@ def main_app():
                         st.error(f"Error: {e}")
                         save_message(st.session_state['current_session'], 'system', str(e))
 
+            st.session_state['messages'] = load_messages(st.session_state['current_session'])
             st.rerun()
 
-# ─── Entry ───────────────────────────────────────────────
+# ─── Entry Point ─────────────────────────────────────────
 if __name__ == "__main__":
     if 'authenticated' not in st.session_state:
         st.session_state['authenticated'] = False
