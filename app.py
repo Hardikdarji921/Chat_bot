@@ -9,6 +9,7 @@ from datetime import datetime
 from supabase import create_client, Client
 from duckduckgo_search import DDGS
 import io  # For in-memory file buffers
+from xml.sax.saxutils import escape  # Added for PDF safety
 
 # ─── NEW: For improved PDF generation with styling ───────
 from reportlab.lib.pagesizes import letter
@@ -272,7 +273,7 @@ def generate_session_markdown(session_id: int):
 
         # Preserve images if content contains image URLs or markdown images
         if "http" in content and any(ext in content.lower() for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
-            lines.append(f"**[{ts}] {role}**  \n{content}")
+            lines.append(f"**[{ts}] {role}** \n{content}")
         else:
             lines.append(f"**[{ts}] {role}**")
             lines.append(content.replace("\n", "  \n"))  # preserve line breaks
@@ -358,22 +359,29 @@ def generate_session_pdf_bytes(session_id: int):
     story.append(Spacer(1, 24))
 
     story.append(Paragraph("System Prompt:", role_style))
-    story.append(Paragraph(session['system_prompt'].replace("\n", "<br/>"), content_style))
+    # Escape system prompt for safety
+    safe_sys_prompt = escape(session['system_prompt']).replace("\n", "<br/>")
+    story.append(Paragraph(safe_sys_prompt, content_style))
     story.append(Spacer(1, 36))
 
     # Messages
     for msg in messages:
         ts = str(msg['timestamp'])
         role = msg['role'].upper()
-        content = msg['content'].replace("\n", "<br/>")
+        
+        # FIXED: Escape content to prevent Paragraph parser syntax errors
+        raw_msg_content = msg['content']
+        # Also clean up Unicode tree characters which often fail in Helvetica
+        clean_content = raw_msg_content.replace("\u251c", "|-").replace("\u2500", "-").replace("\u2514", "|_").replace("\u2502", "|")
+        content = escape(clean_content).replace("\n", "<br/>")
 
         # Detect if message contains image URL
         image_url = None
-        if "http" in content and any(ext in content.lower() for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
+        if "http" in raw_msg_content and any(ext in raw_msg_content.lower() for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
             # Very basic URL extraction - improve if needed
-            start = content.find("http")
-            end = content.find(" ", start) if " " in content[start:] else len(content)
-            image_url = content[start:end].strip()
+            start = raw_msg_content.find("http")
+            end = raw_msg_content.find(" ", start) if " " in raw_msg_content[start:] else len(raw_msg_content)
+            image_url = raw_msg_content[start:end].strip()
 
         story.append(Paragraph(f"[{ts}] {role}", role_style))
         story.append(Paragraph(content, content_style))
@@ -384,9 +392,6 @@ def generate_session_pdf_bytes(session_id: int):
             story.append(Spacer(1, 12))
 
         story.append(Spacer(1, 18))
-
-    # Build PDF
-    doc.build(story)
 
     # Footer (page number) - added via onPage
     def add_page_number(canvas, doc):
@@ -399,8 +404,7 @@ def generate_session_pdf_bytes(session_id: int):
             f"Page {page_num} • Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
 
-    # Re-build with footer
-    buffer.seek(0)
+    # Build PDF with footer
     doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
 
     buffer.seek(0)
