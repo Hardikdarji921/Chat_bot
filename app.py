@@ -9,38 +9,93 @@ from datetime import datetime
 from supabase import create_client, Client
 from duckduckgo_search import DDGS
 import io  # For in-memory file buffers
-from xml.sax.saxutils import escape  # Added for PDF safety
 
 # ─── NEW: For improved PDF generation with styling ───────
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Preformatted
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
-from reportlab.pdfgen import canvas
+
+# ────────────────────────────────────────────────────────────────
+# RECOMMENDED FULL DATABASE SCHEMA (run in Supabase SQL Editor)
+# ────────────────────────────────────────────────────────────────
+"""
+-- Users table (already exists)
+CREATE TABLE public.users (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    username    TEXT NOT NULL UNIQUE,
+    telegram_id TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Sessions table (already exists, but add updated_at for better sorting)
+CREATE TABLE public.sessions (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id       BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ DEFAULT NOW(),
+    title         TEXT,
+    system_prompt TEXT DEFAULT 'You are a helpful assistant.',
+    persona_name  TEXT DEFAULT 'Default Assistant'
+);
+
+-- Messages table (already exists)
+CREATE TABLE public.messages (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id  BIGINT NOT NULL REFERENCES public.sessions(id) ON DELETE CASCADE,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    timestamp   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for performance
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id    ON public.sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_session_id ON public.messages(session_id);
+
+-- Optional: auto-update updated_at on message insert
+CREATE OR REPLACE FUNCTION update_session_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE public.sessions SET updated_at = NOW() WHERE id = NEW.session_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER IF NOT EXISTS trig_messages_update_session_ts
+AFTER INSERT ON public.messages
+FOR EACH ROW EXECUTE FUNCTION update_session_timestamp();
+
+-- Enable Row Level Security (RLS) - very important for multi-user safety
+ALTER TABLE public.users     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sessions  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.messages  ENABLE ROW LEVEL SECURITY;
+
+-- Example policies (adjust based on your auth setup)
+CREATE POLICY "Users see own data" ON public.users
+    FOR ALL USING (auth.uid() = id);  -- if using Supabase Auth
+
+CREATE POLICY "Sessions owned by user" ON public.sessions
+    FOR ALL USING (user_id = (SELECT id FROM public.users WHERE telegram_id = auth.uid() OR username = current_user));
+
+-- Similar for messages via session ownership...
+"""
 
 # ─── Configuration ───────────────────────────────────────
-# File where Telegram token and NVIDIA API key are stored
 CONFIG_FILE = 'config.json'
-# Name of the Telegram bot script to start/stop
 BOT_SCRIPT = 'telegram_bot.py'
 
-# Main login password hash (for the Streamlit app dashboard)
-APP_PASSWORD_HASH = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"  # hash of "password"
+APP_PASSWORD_HASH = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
 
-# Separate admin password hash to protect sensitive settings
 ADMIN_PASSWORD_PLAIN = "Hardik@123"  # ← CHANGE THIS TO A STRONG PASSWORD
 ADMIN_PASSWORD_HASH = hashlib.sha256(ADMIN_PASSWORD_PLAIN.encode()).hexdigest()
 
-# Supabase connection details (public anon key - safe for client-side)
 SUPABASE_URL = "https://phonjftgqkutfeigdrts.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBob25qZnRncWt1dGZlaWdkcnRzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE4Mjg5OTAsImV4cCI6MjA4NzQwNDk5MH0.w4ZHZEQXaYHCDMraFRsnRRM1WAfKRhXm25YwB6g33XM"
 
-# Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ─── Page Config ─────────────────────────────────────────
-# Set global Streamlit page settings
 st.set_page_config(
     page_title="NVIDIA AI Chat v5.2",
     page_icon="🤖",
@@ -49,7 +104,6 @@ st.set_page_config(
 )
 
 # ─── Supabase Helper Functions ───────────────────────────
-# Get or create user record based on username
 def get_or_create_user(username: str, telegram_id=None):
     resp = supabase.table("users").select("id").eq("username", username).execute()
     if resp.data:
@@ -57,13 +111,11 @@ def get_or_create_user(username: str, telegram_id=None):
         if telegram_id:
             supabase.table("users").update({"telegram_id": telegram_id}).eq("id", uid).execute()
         return uid
-
     data = {"username": username}
     if telegram_id: data["telegram_id"] = telegram_id
     resp = supabase.table("users").insert(data).execute()
     return resp.data[0]["id"]
 
-# Fetch all sessions for a given user, sorted newest first
 def get_sessions(user_id: int):
     resp = supabase.table("sessions") \
         .select("id, title, created_at, system_prompt, persona_name") \
@@ -72,7 +124,6 @@ def get_sessions(user_id: int):
         .execute()
     return resp.data
 
-# Create a new chat session for the user
 def create_session(user_id: int, title="New Chat"):
     data = {
         "user_id": user_id,
@@ -83,7 +134,6 @@ def create_session(user_id: int, title="New Chat"):
     resp = supabase.table("sessions").insert(data).execute()
     return resp.data[0]["id"]
 
-# Load all messages for a specific session
 def load_messages(session_id: int):
     resp = supabase.table("messages") \
         .select("id, role, content, timestamp") \
@@ -92,7 +142,6 @@ def load_messages(session_id: int):
         .execute()
     return resp.data
 
-# Save a new message (user or assistant) to the database
 def save_message(session_id: int, role: str, content: str):
     supabase.table("messages").insert({
         "session_id": session_id,
@@ -100,45 +149,51 @@ def save_message(session_id: int, role: str, content: str):
         "content": content
     }).execute()
 
-# Update the content of an existing message
 def update_message(msg_id: int, new_content: str):
     supabase.table("messages").update({"content": new_content}).eq("id", msg_id).execute()
 
-# Delete a single message
 def delete_message(msg_id: int):
     supabase.table("messages").delete().eq("id", msg_id).execute()
 
-# Delete all messages after a certain point (used after editing)
 def truncate_messages(session_id: int, msg_id: int):
     supabase.table("messages").delete() \
         .eq("session_id", session_id) \
         .gt("id", msg_id) \
         .execute()
 
-# Update the system prompt of a session
 def update_session_prompt(session_id: int, prompt: str):
     supabase.table("sessions").update({"system_prompt": prompt}).eq("id", session_id).execute()
 
-# Update the display title of a session
 def update_session_title(session_id: int, title: str):
     supabase.table("sessions").update({"title": title}).eq("id", session_id).execute()
 
-# Delete an entire session (messages are deleted via cascade or manually)
+# ─── FIXED: Reliable session deletion ─────────────────────
 def delete_session(session_id: int):
-    # Manually delete messages first to avoid foreign key issues if cascade is not set
-    supabase.table("messages").delete().eq("session_id", session_id).execute()
-    supabase.table("sessions").delete().eq("id", session_id).execute()
+    """
+    Safely delete a session + all its messages.
+    Works even if foreign key cascade is not enabled.
+    """
+    try:
+        # Step 1: Delete all messages in this session
+        supabase.table("messages").delete().eq("session_id", session_id).execute()
+        
+        # Step 2: Delete the session itself
+        resp = supabase.table("sessions").delete().eq("id", session_id).execute()
+        
+        if not resp.data:
+            st.warning("Session not found or already deleted")
+        else:
+            st.success("Session and all messages deleted")
+    except Exception as e:
+        st.error(f"Deletion failed: {str(e)}")
 
-# Get only the system prompt of a session
 def get_session_prompt(session_id: int):
     resp = supabase.table("sessions").select("system_prompt").eq("id", session_id).execute()
     return resp.data[0]["system_prompt"] if resp.data else "You are a helpful assistant."
 
-# Clear all messages in the current session
 def clear_current_session(session_id: int):
     supabase.table("messages").delete().eq("session_id", session_id).execute()
 
-# Send chat completion request to NVIDIA API
 def send_to_nvidia(api_key, model, messages):
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -150,7 +205,6 @@ def send_to_nvidia(api_key, model, messages):
     usage = data.get('usage', {})
     return content, usage
 
-# Check if telegram_bot.py process is currently running
 def check_bot_status():
     try:
         result = subprocess.run(['pgrep', '-f', 'telegram_bot.py'], capture_output=True, text=True)
@@ -158,11 +212,9 @@ def check_bot_status():
     except:
         return False
 
-# Start the Telegram bot in a new process
 def start_bot():
     subprocess.Popen(['python', BOT_SCRIPT], start_new_session=True)
 
-# Gracefully stop the Telegram bot process
 def stop_bot():
     try:
         result = subprocess.run(['pgrep', '-f', 'telegram_bot.py'], capture_output=True, text=True)
@@ -175,7 +227,6 @@ def stop_bot():
 
 # ─── Auto-title generation functions ─────────────────────
 def auto_generate_simple_title(session_id: int):
-    """Simple version: use first user message (zero cost)"""
     messages = load_messages(session_id)
     if not messages:
         return None
@@ -194,22 +245,14 @@ def auto_generate_simple_title(session_id: int):
     return None
 
 def auto_generate_llm_title(session_id: int, api_key: str, model: str):
-    """Better version: ask LLM to summarize (after some messages)"""
     messages = load_messages(session_id)
     if len(messages) < 4:
         return None
     recent = messages[-6:]
     context = "\n".join([f"{m['role']}: {m['content'][:150]}" for m in recent])
     prompt_messages = [
-        {
-            "role": "system",
-            "content": "Create a very short, clear session title (4–8 words max). "
-                       "Focus on the main topic. No quotes, no explanations, no punctuation at the end."
-        },
-        {
-            "role": "user",
-            "content": f"Summarize this conversation into a short title:\n\n{context}"
-        }
+        {"role": "system", "content": "Create a very short, clear session title (4–8 words max). Focus on the main topic. No quotes, no explanations, no punctuation at the end."},
+        {"role": "user", "content": f"Summarize this conversation into a short title:\n\n{context}"}
     ]
     try:
         title_raw, _ = send_to_nvidia(api_key, model, prompt_messages)
@@ -222,12 +265,10 @@ def auto_generate_llm_title(session_id: int, api_key: str, model: str):
         pass
     return None
 
-# ─── Generate readable text content for fallback/export ──
+# ─── Export / Download Functions ─────────────────────────
 def generate_session_text(session_id: int):
-    """Builds a readable plain-text representation of the entire session"""
     session = supabase.table("sessions").select("title, system_prompt, persona_name, created_at").eq("id", session_id).single().execute().data
     messages = load_messages(session_id)
-
     lines = []
     lines.append("═══════════════════════════════════════════════════════════════")
     lines.append(f"Session ID: {session_id}")
@@ -236,7 +277,6 @@ def generate_session_text(session_id: int):
     lines.append(f"Persona: {session['persona_name']}")
     lines.append(f"System Prompt:\n{session['system_prompt']}")
     lines.append("═══════════════════════════════════════════════════════════════\n")
-
     for msg in messages:
         role = msg['role'].upper()
         ts = msg['timestamp']
@@ -244,166 +284,60 @@ def generate_session_text(session_id: int):
         lines.append(f"[{ts}] {role}:")
         lines.append(content)
         lines.append("─" * 70 + "\n")
-
     return "\n".join(lines)
 
-# ─── Generate Markdown content for .md export ────────────
 def generate_session_markdown(session_id: int):
-    """Creates Markdown-formatted content of the session with images preserved"""
     session = supabase.table("sessions").select("title, system_prompt, persona_name, created_at").eq("id", session_id).single().execute().data
     messages = load_messages(session_id)
-
     lines = []
     lines.append(f"# {session['title'] or 'Untitled Chat'}")
-    lines.append("")
     lines.append(f"**Session ID:** {session_id}")
     lines.append(f"**Created:** {session['created_at']}")
     lines.append(f"**Persona:** {session['persona_name']}")
-    lines.append("")
     lines.append("**System Prompt:**")
-    lines.append(f"```text")
-    lines.append(session['system_prompt'])
-    lines.append("```")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-
+    lines.append(f"```text\n{session['system_prompt']}\n```")
+    lines.append("---\n")
     for msg in messages:
         role = msg['role'].capitalize()
         ts = msg['timestamp']
-        content = msg['content'].strip()
-
-        # Preserve images if content contains image URLs or markdown images
-        if "http" in content and any(ext in content.lower() for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
-            lines.append(f"**[{ts}] {role}** \n{content}")
-        else:
-            lines.append(f"**[{ts}] {role}**")
-            lines.append(content.replace("\n", "  \n"))  # preserve line breaks
-
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-
+        content = msg['content'].replace("\n", "  \n")
+        lines.append(f"### [{ts}] {role}")
+        lines.append(content)
+        lines.append("\n---\n")
     return "\n".join(lines)
 
-# ─── NEW: Improved PDF generation with colors, fonts, header/footer ──
 def generate_session_pdf_bytes(session_id: int):
-    """Creates a styled PDF with header, footer, colors, and monospaced code blocks"""
     session = supabase.table("sessions").select("title, system_prompt, persona_name, created_at").eq("id", session_id).single().execute().data
     messages = load_messages(session_id)
-
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=letter,
-        rightMargin=50,
-        leftMargin=50,
-        topMargin=50,
-        bottomMargin=50
-    )
-
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=50, leftMargin=50, topMargin=50, bottomMargin=50)
     styles = getSampleStyleSheet()
-
-    # Custom styles
-    title_style = ParagraphStyle(
-        'Title',
-        parent=styles['Title'],
-        fontName='Helvetica-Bold',
-        fontSize=18,
-        textColor=colors.darkblue,
-        spaceAfter=12
-    )
-
-    subtitle_style = ParagraphStyle(
-        'Subtitle',
-        parent=styles['Heading2'],
-        fontName='Helvetica',
-        fontSize=11,
-        textColor=colors.grey,
-        spaceAfter=6
-    )
-
-    role_style = ParagraphStyle(
-        'Role',
-        parent=styles['Heading3'],
-        fontName='Helvetica-Bold',
-        fontSize=11,
-        textColor=colors.navy,
-        spaceBefore=12,
-        spaceAfter=4
-    )
-
-    content_style = ParagraphStyle(
-        'Content',
-        parent=styles['Normal'],
-        fontName='Helvetica',
-        fontSize=10,
-        leading=13,
-        spaceAfter=8
-    )
-
-    # Specific style for code blocks to maintain alignment
-    code_style = ParagraphStyle(
-        'Code',
-        parent=styles['Normal'],
-        fontName='Courier',
-        fontSize=9,
-        leading=11,
-        leftIndent=10,
-        rightIndent=10,
-        textColor=colors.black,
-        backColor=colors.whitesmoke,
-        borderPadding=5,
-        spaceAfter=10
-    )
-
+    title_style = ParagraphStyle('Title', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=18, textColor=colors.darkblue, spaceAfter=12)
+    subtitle_style = ParagraphStyle('Subtitle', parent=styles['Heading2'], fontName='Helvetica', fontSize=11, textColor=colors.grey, spaceAfter=6)
+    role_style = ParagraphStyle('Role', parent=styles['Heading3'], fontName='Helvetica-Bold', fontSize=11, textColor=colors.navy, spaceBefore=12, spaceAfter=6)
+    content_style = ParagraphStyle('Content', parent=styles['Normal'], fontName='Helvetica', fontSize=10, leading=13, spaceAfter=8)
     story = []
-
-    # Header
     story.append(Paragraph(f"{session['title'] or 'Chat Session'}", title_style))
     story.append(Paragraph(f"Session ID: {session_id} • Created: {session['created_at']}", subtitle_style))
     story.append(Spacer(1, 12))
     story.append(Paragraph(f"Persona: {session['persona_name']}", subtitle_style))
-    story.append(Spacer(1, 10))
-
+    story.append(Spacer(1, 24))
     story.append(Paragraph("System Prompt:", role_style))
-    safe_sys_prompt = escape(session['system_prompt']).replace("\n", "<br/>")
+    safe_sys_prompt = session['system_prompt'].replace("\n", "<br/>")
     story.append(Paragraph(safe_sys_prompt, content_style))
-    story.append(Spacer(1, 20))
-
-    # Messages
+    story.append(Spacer(1, 36))
     for msg in messages:
         ts = str(msg['timestamp'])
         role = msg['role'].upper()
-        raw_content = msg['content']
-
-        # Clean Unicode 'Tree' characters that break alignment/font rendering
-        clean_content = raw_content.replace("\u251c", "|-").replace("\u2500", "-").replace("\u2514", "|_").replace("\u2502", "|")
-        
+        content = msg['content'].replace("\n", "<br/>")
         story.append(Paragraph(f"[{ts}] {role}", role_style))
-
-        # Check if content looks like code
-        if "```" in clean_content or "<?php" in clean_content or "class=" in clean_content:
-            display_content = clean_content.replace("```php", "").replace("```text", "").replace("```", "")
-            safe_code = escape(display_content).replace("\n", "<br/>")
-            story.append(Paragraph(safe_code, code_style))
-        else:
-            safe_content = escape(clean_content).replace("\n", "<br/>")
-            story.append(Paragraph(safe_content, content_style))
-
-        story.append(Spacer(1, 10))
-
-    # Footer (page number)
+        story.append(Paragraph(content, content_style))
+        story.append(Spacer(1, 18))
     def add_page_number(canvas, doc):
         page_num = canvas.getPageNumber()
         canvas.setFont("Helvetica", 9)
         canvas.setFillColor(colors.grey)
-        canvas.drawRightString(
-            doc.rightMargin + doc.width,
-            doc.bottomMargin - 0.4 * inch,
-            f"Page {page_num} • Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        )
-
+        canvas.drawRightString(doc.rightMargin + doc.width, doc.bottomMargin - 0.4*inch, f"Page {page_num} • Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
     buffer.seek(0)
     return buffer
@@ -432,6 +366,8 @@ def save_config(cfg):
 
 # ─── Main App ────────────────────────────────────────────
 def main_app():
+    config = load_config()
+
     with st.sidebar:
         st.title("⚙️ Controls")
 
@@ -451,7 +387,7 @@ def main_app():
 
         user_id = st.session_state['user_id']
 
-        # ── ADMIN SECTION ── PROTECTED ────────────────────────────────
+        # Admin section
         st.subheader("🛡️ Admin / Developer Settings")
         admin_pass = st.text_input("Admin password", type="password", key="admin_unlock")
 
@@ -460,13 +396,7 @@ def main_app():
                 st.success("Admin access granted", icon="🔓")
 
                 st.subheader("📱 Telegram Bot")
-                config = load_config()
-                token_input = st.text_input(
-                    "Bot Token",
-                    value=config.get('telegram_token', ''),
-                    type="password",
-                    key="bot_token_protected"
-                )
+                token_input = st.text_input("Bot Token", value=config.get('telegram_token', ''), type="password", key="bot_token_protected")
                 if st.button("Save Token", key="save_token_protected"):
                     config['telegram_token'] = token_input.strip()
                     save_config(config)
@@ -493,12 +423,7 @@ def main_app():
                 st.divider()
 
                 st.subheader("🔑 NVIDIA API")
-                api_key_input = st.text_input(
-                    "NVIDIA API Key",
-                    value=config.get('api_key', ''),
-                    type="password",
-                    key="nvidia_key_protected"
-                )
+                api_key_input = st.text_input("NVIDIA API Key", value=config.get('api_key', ''), type="password", key="nvidia_key_protected")
                 if st.button("Save Key", key="save_key_protected"):
                     config['api_key'] = api_key_input.strip()
                     save_config(config)
@@ -511,7 +436,6 @@ def main_app():
 
         st.divider()
 
-        config = load_config()
         model = st.selectbox("Model", [
             "meta/llama3-70b-instruct",
             "meta/llama3-8b-instruct",
@@ -519,6 +443,7 @@ def main_app():
             "google/gemma-7b-it"
         ], index=0)
 
+        # Persona selection (unchanged)
         st.subheader("🎭 Persona")
         personas = {
             "Default Assistant": "You are a helpful, concise and friendly assistant.",
@@ -527,7 +452,6 @@ def main_app():
             "Story Teller": "You are a creative storyteller. Use vivid language, build suspense.",
             "Ultra Concise": "Answer in 1–2 short sentences. No fluff."
         }
-
         selected = st.selectbox("Select persona", list(personas.keys()))
         if st.button("Apply"):
             prompt = personas[selected]
@@ -540,6 +464,7 @@ def main_app():
 
         st.divider()
 
+        # Sessions – FIXED deletion logic
         st.subheader("📁 Your Sessions")
 
         if st.button("➕ New Session"):
@@ -556,37 +481,29 @@ def main_app():
                 title = s['title'] or f"Chat {s['created_at'][:16].replace('T', ' ')}"
                 is_active = 'current_session' in st.session_state and st.session_state['current_session'] == s['id']
 
-                # Create an expansion/renaming UI for the active session
-                if is_active:
-                    st.markdown(f"**Current: {title}**")
-                    new_title = st.text_input("Rename Session", value=title, key=f"rename_input_{s['id']}")
-                    if st.button("Save New Name", key=f"rename_btn_{s['id']}"):
-                        update_session_title(s['id'], new_title)
+                cols = st.columns([7, 1])
+                with cols[0]:
+                    if st.button(
+                        f"{'→ ' if is_active else ''}{title}",
+                        key=f"load_session_{s['id']}",
+                        use_container_width=True,
+                        type="primary" if is_active else "secondary"
+                    ):
+                        st.session_state['current_session'] = s['id']
+                        st.session_state['messages'] = load_messages(s['id'])
+                        st.session_state['system_prompt'] = get_session_prompt(s['id'])
                         st.rerun()
-                    
-                    if st.button("🗑 Delete Session", key=f"del_btn_{s['id']}", use_container_width=True):
+
+                with cols[1]:
+                    if st.button("🗑", key=f"delete_session_{s['id']}"):
                         delete_session(s['id'])
-                        del st.session_state['current_session']
+                        # Clean up session state if the deleted one was active
+                        if 'current_session' in st.session_state and st.session_state['current_session'] == s['id']:
+                            del st.session_state['current_session']
+                        st.success("Session deleted")
                         st.rerun()
-                else:
-                    cols = st.columns([7, 1])
-                    with cols[0]:
-                        if st.button(
-                            title,
-                            key=f"load_session_{s['id']}",
-                            use_container_width=True
-                        ):
-                            st.session_state['current_session'] = s['id']
-                            st.session_state['messages'] = load_messages(s['id'])
-                            st.session_state['system_prompt'] = get_session_prompt(s['id'])
-                            st.rerun()
-                    with cols[1]:
-                        if st.button("🗑", key=f"quick_del_{s['id']}"):
-                            delete_session(s['id'])
-                            st.rerun()
 
         if 'current_session' in st.session_state:
-            st.divider()
             if st.button("🧹 Clear current messages"):
                 clear_current_session(st.session_state['current_session'])
                 st.session_state['messages'] = []
@@ -597,16 +514,9 @@ def main_app():
     st.title("🤖 NVIDIA AI Chat")
 
     if 'current_session' not in st.session_state:
-        # Check if user has any sessions first before creating one automatically
-        sessions = get_sessions(user_id)
-        if sessions:
-            st.session_state['current_session'] = sessions[0]['id']
-            st.session_state['messages'] = load_messages(sessions[0]['id'])
-            st.session_state['system_prompt'] = get_session_prompt(sessions[0]['id'])
-        else:
-            st.session_state['current_session'] = create_session(user_id)
-            st.session_state['messages'] = []
-            st.session_state['system_prompt'] = "You are a helpful assistant."
+        st.session_state['current_session'] = create_session(st.session_state['user_id'])
+        st.session_state['messages'] = []
+        st.session_state['system_prompt'] = "You are a helpful assistant."
 
     if 'messages' not in st.session_state:
         st.session_state['messages'] = load_messages(st.session_state['current_session'])
@@ -627,7 +537,7 @@ def main_app():
             st.markdown(msg["content"])
             st.caption(str(msg["timestamp"]))
 
-    # ─── Export Section: PDF & Markdown ──
+    # Export Section: PDF & Markdown
     if 'current_session' in st.session_state:
         st.markdown("---")
         st.subheader("Export / Download Session")
@@ -635,13 +545,11 @@ def main_app():
         col_pdf, col_md = st.columns(2)
 
         with col_pdf:
-            if st.button("📄 Download as Aligned PDF", use_container_width=True):
+            if st.button("📄 Download as Styled PDF", use_container_width=True):
                 pdf_buffer = generate_session_pdf_bytes(st.session_state['current_session'])
-
                 session_title = supabase.table("sessions").select("title").eq("id", st.session_state['current_session']).single().execute().data['title']
                 safe_title = (session_title or "Chat_Session").replace(" ", "_").replace("/", "-")[:50]
                 filename = f"{safe_title}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-
                 st.download_button(
                     label="Click to download PDF",
                     data=pdf_buffer,
@@ -649,16 +557,14 @@ def main_app():
                     mime="application/pdf",
                     key="download_pdf_styled"
                 )
-                st.success(f"Aligned PDF ready: {filename}")
+                st.success(f"Styled PDF ready: {filename}")
 
         with col_md:
             if st.button("📝 Download as Markdown (.md)", use_container_width=True):
                 md_content = generate_session_markdown(st.session_state['current_session'])
-
                 session_title = supabase.table("sessions").select("title").eq("id", st.session_state['current_session']).single().execute().data['title']
                 safe_title = (session_title or "Chat_Session").replace(" ", "_").replace("/", "-")[:50]
                 filename = f"{safe_title}_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
-
                 st.download_button(
                     label="Click to download .md",
                     data=md_content,
