@@ -18,7 +18,7 @@ APP_PASSWORD_HASH = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1
 
 # NEW: Separate admin password to unlock sensitive settings
 # Change this to something strong and keep it secret
-ADMIN_PASSWORD_PLAIN = "admin2025secret"  # ← CHANGE THIS
+ADMIN_PASSWORD_PLAIN = "Hardik@123"  # ← CHANGE THIS
 ADMIN_PASSWORD_HASH = hashlib.sha256(ADMIN_PASSWORD_PLAIN.encode()).hexdigest()
 
 SUPABASE_URL = "https://phonjftgqkutfeigdrts.supabase.co"
