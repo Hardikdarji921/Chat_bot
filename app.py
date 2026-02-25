@@ -13,7 +13,7 @@ from xml.sax.saxutils import escape  # Added for PDF safety
 
 # ─── NEW: For improved PDF generation with styling ───────
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Preformatted
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
@@ -125,6 +125,8 @@ def update_session_title(session_id: int, title: str):
 
 # Delete an entire session (messages are deleted via cascade or manually)
 def delete_session(session_id: int):
+    # Manually delete messages first to avoid foreign key issues if cascade is not set
+    supabase.table("messages").delete().eq("session_id", session_id).execute()
     supabase.table("sessions").delete().eq("id", session_id).execute()
 
 # Get only the system prompt of a session
@@ -286,7 +288,7 @@ def generate_session_markdown(session_id: int):
 
 # ─── NEW: Improved PDF generation with colors, fonts, header/footer ──
 def generate_session_pdf_bytes(session_id: int):
-    """Creates a styled PDF with header, footer, colors, and image placeholders"""
+    """Creates a styled PDF with header, footer, colors, and monospaced code blocks"""
     session = supabase.table("sessions").select("title, system_prompt, persona_name, created_at").eq("id", session_id).single().execute().data
     messages = load_messages(session_id)
 
@@ -294,15 +296,15 @@ def generate_session_pdf_bytes(session_id: int):
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
-        rightMargin=72,
-        leftMargin=72,
-        topMargin=72,
-        bottomMargin=72
+        rightMargin=50,
+        leftMargin=50,
+        topMargin=50,
+        bottomMargin=50
     )
 
     styles = getSampleStyleSheet()
 
-    # Custom styles for better look
+    # Custom styles
     title_style = ParagraphStyle(
         'Title',
         parent=styles['Title'],
@@ -316,7 +318,7 @@ def generate_session_pdf_bytes(session_id: int):
         'Subtitle',
         parent=styles['Heading2'],
         fontName='Helvetica',
-        fontSize=12,
+        fontSize=11,
         textColor=colors.grey,
         spaceAfter=6
     )
@@ -325,10 +327,10 @@ def generate_session_pdf_bytes(session_id: int):
         'Role',
         parent=styles['Heading3'],
         fontName='Helvetica-Bold',
-        fontSize=12,
+        fontSize=11,
         textColor=colors.navy,
         spaceBefore=12,
-        spaceAfter=6
+        spaceAfter=4
     )
 
     content_style = ParagraphStyle(
@@ -336,77 +338,73 @@ def generate_session_pdf_bytes(session_id: int):
         parent=styles['Normal'],
         fontName='Helvetica',
         fontSize=10,
-        leading=14,
+        leading=13,
         spaceAfter=8
     )
 
-    timestamp_style = ParagraphStyle(
-        'Timestamp',
-        parent=styles['Italic'],
-        fontName='Helvetica-Oblique',
+    # Specific style for code blocks to maintain alignment
+    code_style = ParagraphStyle(
+        'Code',
+        parent=styles['Normal'],
+        fontName='Courier',
         fontSize=9,
-        textColor=colors.grey,
-        spaceAfter=4
+        leading=11,
+        leftIndent=10,
+        rightIndent=10,
+        textColor=colors.black,
+        backColor=colors.whitesmoke,
+        borderPadding=5,
+        spaceAfter=10
     )
 
     story = []
 
-    # Header (on first page)
+    # Header
     story.append(Paragraph(f"{session['title'] or 'Chat Session'}", title_style))
     story.append(Paragraph(f"Session ID: {session_id} • Created: {session['created_at']}", subtitle_style))
     story.append(Spacer(1, 12))
     story.append(Paragraph(f"Persona: {session['persona_name']}", subtitle_style))
-    story.append(Spacer(1, 24))
+    story.append(Spacer(1, 10))
 
     story.append(Paragraph("System Prompt:", role_style))
-    # Escape system prompt for safety
     safe_sys_prompt = escape(session['system_prompt']).replace("\n", "<br/>")
     story.append(Paragraph(safe_sys_prompt, content_style))
-    story.append(Spacer(1, 36))
+    story.append(Spacer(1, 20))
 
     # Messages
     for msg in messages:
         ts = str(msg['timestamp'])
         role = msg['role'].upper()
+        raw_content = msg['content']
+
+        # Clean Unicode 'Tree' characters that break alignment/font rendering
+        clean_content = raw_content.replace("\u251c", "|-").replace("\u2500", "-").replace("\u2514", "|_").replace("\u2502", "|")
         
-        # FIXED: Escape content to prevent Paragraph parser syntax errors
-        raw_msg_content = msg['content']
-        # Also clean up Unicode tree characters which often fail in Helvetica
-        clean_content = raw_msg_content.replace("\u251c", "|-").replace("\u2500", "-").replace("\u2514", "|_").replace("\u2502", "|")
-        content = escape(clean_content).replace("\n", "<br/>")
-
-        # Detect if message contains image URL
-        image_url = None
-        if "http" in raw_msg_content and any(ext in raw_msg_content.lower() for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
-            # Very basic URL extraction - improve if needed
-            start = raw_msg_content.find("http")
-            end = raw_msg_content.find(" ", start) if " " in raw_msg_content[start:] else len(raw_msg_content)
-            image_url = raw_msg_content[start:end].strip()
-
         story.append(Paragraph(f"[{ts}] {role}", role_style))
-        story.append(Paragraph(content, content_style))
 
-        # Placeholder for image in PDF (reportlab doesn't embed remote images easily)
-        if image_url:
-            story.append(Paragraph(f"[Image included in original chat: {image_url}]", timestamp_style))
-            story.append(Spacer(1, 12))
+        # Check if content looks like code
+        if "```" in clean_content or "<?php" in clean_content or "class=" in clean_content:
+            display_content = clean_content.replace("```php", "").replace("```text", "").replace("```", "")
+            safe_code = escape(display_content).replace("\n", "<br/>")
+            story.append(Paragraph(safe_code, code_style))
+        else:
+            safe_content = escape(clean_content).replace("\n", "<br/>")
+            story.append(Paragraph(safe_content, content_style))
 
-        story.append(Spacer(1, 18))
+        story.append(Spacer(1, 10))
 
-    # Footer (page number) - added via onPage
+    # Footer (page number)
     def add_page_number(canvas, doc):
         page_num = canvas.getPageNumber()
         canvas.setFont("Helvetica", 9)
         canvas.setFillColor(colors.grey)
         canvas.drawRightString(
             doc.rightMargin + doc.width,
-            doc.bottomMargin - 0.5 * inch,
+            doc.bottomMargin - 0.4 * inch,
             f"Page {page_num} • Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
 
-    # Build PDF with footer
     doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
-
     buffer.seek(0)
     return buffer
 
@@ -558,27 +556,37 @@ def main_app():
                 title = s['title'] or f"Chat {s['created_at'][:16].replace('T', ' ')}"
                 is_active = 'current_session' in st.session_state and st.session_state['current_session'] == s['id']
 
-                cols = st.columns([7, 1])
-                with cols[0]:
-                    if st.button(
-                        f"{'→ ' if is_active else ''}{title}",
-                        key=f"load_session_{s['id']}",
-                        use_container_width=True,
-                        type="primary" if is_active else "secondary"
-                    ):
-                        st.session_state['current_session'] = s['id']
-                        st.session_state['messages'] = load_messages(s['id'])
-                        st.session_state['system_prompt'] = get_session_prompt(s['id'])
+                # Create an expansion/renaming UI for the active session
+                if is_active:
+                    st.markdown(f"**Current: {title}**")
+                    new_title = st.text_input("Rename Session", value=title, key=f"rename_input_{s['id']}")
+                    if st.button("Save New Name", key=f"rename_btn_{s['id']}"):
+                        update_session_title(s['id'], new_title)
                         st.rerun()
-
-                with cols[1]:
-                    if st.button("🗑", key=f"delete_session_{s['id']}"):
+                    
+                    if st.button("🗑 Delete Session", key=f"del_btn_{s['id']}", use_container_width=True):
                         delete_session(s['id'])
-                        if 'current_session' in st.session_state and st.session_state['current_session'] == s['id']:
-                            del st.session_state['current_session']
+                        del st.session_state['current_session']
                         st.rerun()
+                else:
+                    cols = st.columns([7, 1])
+                    with cols[0]:
+                        if st.button(
+                            title,
+                            key=f"load_session_{s['id']}",
+                            use_container_width=True
+                        ):
+                            st.session_state['current_session'] = s['id']
+                            st.session_state['messages'] = load_messages(s['id'])
+                            st.session_state['system_prompt'] = get_session_prompt(s['id'])
+                            st.rerun()
+                    with cols[1]:
+                        if st.button("🗑", key=f"quick_del_{s['id']}"):
+                            delete_session(s['id'])
+                            st.rerun()
 
         if 'current_session' in st.session_state:
+            st.divider()
             if st.button("🧹 Clear current messages"):
                 clear_current_session(st.session_state['current_session'])
                 st.session_state['messages'] = []
@@ -589,9 +597,16 @@ def main_app():
     st.title("🤖 NVIDIA AI Chat")
 
     if 'current_session' not in st.session_state:
-        st.session_state['current_session'] = create_session(st.session_state['user_id'])
-        st.session_state['messages'] = []
-        st.session_state['system_prompt'] = "You are a helpful assistant."
+        # Check if user has any sessions first before creating one automatically
+        sessions = get_sessions(user_id)
+        if sessions:
+            st.session_state['current_session'] = sessions[0]['id']
+            st.session_state['messages'] = load_messages(sessions[0]['id'])
+            st.session_state['system_prompt'] = get_session_prompt(sessions[0]['id'])
+        else:
+            st.session_state['current_session'] = create_session(user_id)
+            st.session_state['messages'] = []
+            st.session_state['system_prompt'] = "You are a helpful assistant."
 
     if 'messages' not in st.session_state:
         st.session_state['messages'] = load_messages(st.session_state['current_session'])
@@ -612,7 +627,7 @@ def main_app():
             st.markdown(msg["content"])
             st.caption(str(msg["timestamp"]))
 
-    # ─── Export Section: PDF & Markdown with improved PDF styling ──
+    # ─── Export Section: PDF & Markdown ──
     if 'current_session' in st.session_state:
         st.markdown("---")
         st.subheader("Export / Download Session")
@@ -620,7 +635,7 @@ def main_app():
         col_pdf, col_md = st.columns(2)
 
         with col_pdf:
-            if st.button("📄 Download as Styled PDF", use_container_width=True):
+            if st.button("📄 Download as Aligned PDF", use_container_width=True):
                 pdf_buffer = generate_session_pdf_bytes(st.session_state['current_session'])
 
                 session_title = supabase.table("sessions").select("title").eq("id", st.session_state['current_session']).single().execute().data['title']
@@ -634,7 +649,7 @@ def main_app():
                     mime="application/pdf",
                     key="download_pdf_styled"
                 )
-                st.success(f"Styled PDF ready: {filename}")
+                st.success(f"Aligned PDF ready: {filename}")
 
         with col_md:
             if st.button("📝 Download as Markdown (.md)", use_container_width=True):
