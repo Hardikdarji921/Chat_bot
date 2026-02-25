@@ -35,8 +35,6 @@ st.set_page_config(
 )
 
 # ─── Supabase Helpers ────────────────────────────────────
-# (keeping your original helper functions – not repeating them here for brevity)
-
 def get_or_create_user(username: str, telegram_id=None):
     resp = supabase.table("users").select("id").eq("username", username).execute()
     if resp.data:
@@ -191,6 +189,9 @@ def main_app():
         username = st.text_input("Username", value="hardik")
         if st.button("Set User"):
             st.session_state['user_id'] = get_or_create_user(username)
+            # Reset current session when changing user
+            if 'current_session' in st.session_state:
+                del st.session_state['current_session']
             st.success(f"User set to: {username}")
             st.rerun()
 
@@ -293,8 +294,9 @@ def main_app():
 
         st.divider()
 
-        # Sessions
-        st.subheader("📁 Sessions")
+        # Sessions – improved listing
+        st.subheader("📁 Your Sessions")
+
         if st.button("➕ New Session"):
             sid = create_session(user_id)
             st.session_state['current_session'] = sid
@@ -303,23 +305,34 @@ def main_app():
             st.rerun()
 
         sessions = get_sessions(user_id)
+
         if sessions:
-            opts = {f"{s['title']} ({s.get('persona_name','Default')}) — ID:{s['id']}": s['id'] for s in sessions}
-            choice = st.selectbox("Open session", list(opts.keys()))
-            if st.button("Load"):
-                sid = opts[choice]
-                st.session_state['current_session'] = sid
-                st.session_state['messages'] = load_messages(sid)
-                st.session_state['system_prompt'] = get_session_prompt(sid)
-                st.rerun()
+            for s in sessions:
+                title = s['title'] or f"Chat {s['created_at'][:16]}"
+                is_active = 'current_session' in st.session_state and st.session_state['current_session'] == s['id']
+
+                cols = st.columns([6, 1])
+                with cols[0]:
+                    if st.button(
+                        f"{'→ ' if is_active else ''}{title}",
+                        key=f"session_load_{s['id']}",
+                        use_container_width=True,
+                        type="primary" if is_active else "secondary"
+                    ):
+                        st.session_state['current_session'] = s['id']
+                        st.session_state['messages'] = load_messages(s['id'])
+                        st.session_state['system_prompt'] = get_session_prompt(s['id'])
+                        st.rerun()
+
+                with cols[1]:
+                    if st.button("🗑", key=f"session_del_{s['id']}"):
+                        delete_session(s['id'])
+                        if 'current_session' in st.session_state and st.session_state['current_session'] == s['id']:
+                            del st.session_state['current_session']
+                        st.rerun()
 
         if 'current_session' in st.session_state:
-            if st.button("🗑️ Delete current session"):
-                delete_session(st.session_state['current_session'])
-                st.session_state.pop('current_session', None)
-                st.rerun()
-
-            if st.button("🧹 Clear messages"):
+            if st.button("🧹 Clear current messages"):
                 clear_current_session(st.session_state['current_session'])
                 st.session_state['messages'] = []
                 st.success("Chat cleared")
@@ -339,28 +352,56 @@ def main_app():
     if 'system_prompt' not in st.session_state:
         st.session_state['system_prompt'] = get_session_prompt(st.session_state['current_session'])
 
-    # ── Rest of your chat UI remains unchanged ──
-    # (system prompt editor, message display, editing, regenerate, chat input, etc.)
-    # I'm not repeating it here to keep the answer shorter.
-    # Just keep your existing main chat code below this point.
-
-    # Example placeholder (replace with your full chat logic)
-    with st.expander("System Prompt (edit if needed)"):
+    # System prompt view/edit
+    with st.expander("System Prompt"):
         prompt_edit = st.text_area("Prompt", value=st.session_state['system_prompt'], height=120)
         if st.button("Update Prompt"):
             update_session_prompt(st.session_state['current_session'], prompt_edit)
             st.session_state['system_prompt'] = prompt_edit
-            st.success("System prompt updated")
+            st.success("Updated")
             st.rerun()
 
+    # Messages
     for msg in st.session_state['messages']:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             st.caption(str(msg["timestamp"]))
 
+    # Input
     if prompt := st.chat_input("Message..."):
-        # Your existing message handling logic here...
-        pass
+        if not config.get('api_key'):
+            st.error("NVIDIA API key not set (admin section)")
+        else:
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            save_message(st.session_state['current_session'], 'user', prompt)
+            st.session_state['messages'] = load_messages(st.session_state['current_session'])
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    api_messages = [{"role": "system", "content": st.session_state['system_prompt']}]
+                    for m in st.session_state['messages']:
+                        if m["role"] in ['user', 'assistant']:
+                            api_messages.append({"role": m["role"], "content": m["content"]})
+
+                    try:
+                        response, usage = send_to_nvidia(config['api_key'], model, api_messages)
+                        st.markdown(response)
+
+                        save_message(st.session_state['current_session'], 'assistant', response)
+                        st.session_state['messages'] = load_messages(st.session_state['current_session'])
+
+                        if usage:
+                            pt = usage.get('prompt_tokens', '?')
+                            ct = usage.get('completion_tokens', '?')
+                            st.caption(f"Tokens: {pt} + {ct}")
+
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                        save_message(st.session_state['current_session'], 'system', str(e))
+
+            st.rerun()
 
 # ─── Entry ───────────────────────────────────────────────
 if __name__ == "__main__":
