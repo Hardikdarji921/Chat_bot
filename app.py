@@ -8,6 +8,15 @@ import signal
 from datetime import datetime
 from supabase import create_client, Client
 from duckduckgo_search import DDGS
+import io  # For in-memory file buffers
+
+# ─── NEW: For improved PDF generation with styling ───────
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
 
 # ─── Configuration ───────────────────────────────────────
 # File where Telegram token and NVIDIA API key are stored
@@ -162,40 +171,32 @@ def stop_bot():
         pass
 
 # ─── Auto-title generation functions ─────────────────────
-
 def auto_generate_simple_title(session_id: int):
     """Simple version: use first user message (zero cost)"""
     messages = load_messages(session_id)
     if not messages:
         return None
-
     first_user_msg = next(
         (m['content'].strip() for m in messages if m['role'] == 'user'),
         None
     )
-
     if not first_user_msg:
         return None
-
     title = first_user_msg.replace("\n", " ").strip()
     if len(title) > 60:
         title = title[:57] + "..."
-
     if title:
         update_session_title(session_id, title[:70])
         return title
     return None
-
 
 def auto_generate_llm_title(session_id: int, api_key: str, model: str):
     """Better version: ask LLM to summarize (after some messages)"""
     messages = load_messages(session_id)
     if len(messages) < 4:
         return None
-
     recent = messages[-6:]
     context = "\n".join([f"{m['role']}: {m['content'][:150]}" for m in recent])
-
     prompt_messages = [
         {
             "role": "system",
@@ -207,7 +208,6 @@ def auto_generate_llm_title(session_id: int, api_key: str, model: str):
             "content": f"Summarize this conversation into a short title:\n\n{context}"
         }
     ]
-
     try:
         title_raw, _ = send_to_nvidia(api_key, model, prompt_messages)
         title = title_raw.strip().strip('"').strip("'").strip()
@@ -219,7 +219,194 @@ def auto_generate_llm_title(session_id: int, api_key: str, model: str):
         pass
     return None
 
-# ─── Login Screen ────────────────────────────────────────
+# ─── Generate readable text content for fallback/export ──
+def generate_session_text(session_id: int):
+    """Builds a readable plain-text representation of the entire session"""
+    session = supabase.table("sessions").select("title, system_prompt, persona_name, created_at").eq("id", session_id).single().execute().data
+    messages = load_messages(session_id)
+
+    lines = []
+    lines.append("═══════════════════════════════════════════════════════════════")
+    lines.append(f"Session ID: {session_id}")
+    lines.append(f"Title: {session['title'] or 'Untitled Chat'}")
+    lines.append(f"Created: {session['created_at']}")
+    lines.append(f"Persona: {session['persona_name']}")
+    lines.append(f"System Prompt:\n{session['system_prompt']}")
+    lines.append("═══════════════════════════════════════════════════════════════\n")
+
+    for msg in messages:
+        role = msg['role'].upper()
+        ts = msg['timestamp']
+        content = msg['content'].strip()
+        lines.append(f"[{ts}] {role}:")
+        lines.append(content)
+        lines.append("─" * 70 + "\n")
+
+    return "\n".join(lines)
+
+# ─── Generate Markdown content for .md export ────────────
+def generate_session_markdown(session_id: int):
+    """Creates Markdown-formatted content of the session with images preserved"""
+    session = supabase.table("sessions").select("title, system_prompt, persona_name, created_at").eq("id", session_id).single().execute().data
+    messages = load_messages(session_id)
+
+    lines = []
+    lines.append(f"# {session['title'] or 'Untitled Chat'}")
+    lines.append("")
+    lines.append(f"**Session ID:** {session_id}")
+    lines.append(f"**Created:** {session['created_at']}")
+    lines.append(f"**Persona:** {session['persona_name']}")
+    lines.append("")
+    lines.append("**System Prompt:**")
+    lines.append(f"```text")
+    lines.append(session['system_prompt'])
+    lines.append("```")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    for msg in messages:
+        role = msg['role'].capitalize()
+        ts = msg['timestamp']
+        content = msg['content'].strip()
+
+        # Preserve images if content contains image URLs or markdown images
+        if "http" in content and any(ext in content.lower() for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
+            lines.append(f"**[{ts}] {role}**  \n{content}")
+        else:
+            lines.append(f"**[{ts}] {role}**")
+            lines.append(content.replace("\n", "  \n"))  # preserve line breaks
+
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+# ─── NEW: Improved PDF generation with colors, fonts, header/footer ──
+def generate_session_pdf_bytes(session_id: int):
+    """Creates a styled PDF with header, footer, colors, and image placeholders"""
+    session = supabase.table("sessions").select("title, system_prompt, persona_name, created_at").eq("id", session_id).single().execute().data
+    messages = load_messages(session_id)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=72,
+        leftMargin=72,
+        topMargin=72,
+        bottomMargin=72
+    )
+
+    styles = getSampleStyleSheet()
+
+    # Custom styles for better look
+    title_style = ParagraphStyle(
+        'Title',
+        parent=styles['Title'],
+        fontName='Helvetica-Bold',
+        fontSize=18,
+        textColor=colors.darkblue,
+        spaceAfter=12
+    )
+
+    subtitle_style = ParagraphStyle(
+        'Subtitle',
+        parent=styles['Heading2'],
+        fontName='Helvetica',
+        fontSize=12,
+        textColor=colors.grey,
+        spaceAfter=6
+    )
+
+    role_style = ParagraphStyle(
+        'Role',
+        parent=styles['Heading3'],
+        fontName='Helvetica-Bold',
+        fontSize=12,
+        textColor=colors.navy,
+        spaceBefore=12,
+        spaceAfter=6
+    )
+
+    content_style = ParagraphStyle(
+        'Content',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=10,
+        leading=14,
+        spaceAfter=8
+    )
+
+    timestamp_style = ParagraphStyle(
+        'Timestamp',
+        parent=styles['Italic'],
+        fontName='Helvetica-Oblique',
+        fontSize=9,
+        textColor=colors.grey,
+        spaceAfter=4
+    )
+
+    story = []
+
+    # Header (on first page)
+    story.append(Paragraph(f"{session['title'] or 'Chat Session'}", title_style))
+    story.append(Paragraph(f"Session ID: {session_id} • Created: {session['created_at']}", subtitle_style))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(f"Persona: {session['persona_name']}", subtitle_style))
+    story.append(Spacer(1, 24))
+
+    story.append(Paragraph("System Prompt:", role_style))
+    story.append(Paragraph(session['system_prompt'].replace("\n", "<br/>"), content_style))
+    story.append(Spacer(1, 36))
+
+    # Messages
+    for msg in messages:
+        ts = str(msg['timestamp'])
+        role = msg['role'].upper()
+        content = msg['content'].replace("\n", "<br/>")
+
+        # Detect if message contains image URL
+        image_url = None
+        if "http" in content and any(ext in content.lower() for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
+            # Very basic URL extraction - improve if needed
+            start = content.find("http")
+            end = content.find(" ", start) if " " in content[start:] else len(content)
+            image_url = content[start:end].strip()
+
+        story.append(Paragraph(f"[{ts}] {role}", role_style))
+        story.append(Paragraph(content, content_style))
+
+        # Placeholder for image in PDF (reportlab doesn't embed remote images easily)
+        if image_url:
+            story.append(Paragraph(f"[Image included in original chat: {image_url}]", timestamp_style))
+            story.append(Spacer(1, 12))
+
+        story.append(Spacer(1, 18))
+
+    # Build PDF
+    doc.build(story)
+
+    # Footer (page number) - added via onPage
+    def add_page_number(canvas, doc):
+        page_num = canvas.getPageNumber()
+        canvas.setFont("Helvetica", 9)
+        canvas.setFillColor(colors.grey)
+        canvas.drawRightString(
+            doc.rightMargin + doc.width,
+            doc.bottomMargin - 0.5 * inch,
+            f"Page {page_num} • Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+
+    # Re-build with footer
+    buffer.seek(0)
+    doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+
+    buffer.seek(0)
+    return buffer
+
+# ─── Login ───────────────────────────────────────────────
 def login_screen():
     st.title("🔒 Login")
     password = st.text_input("Password", type="password")
@@ -230,7 +417,7 @@ def login_screen():
         else:
             st.error("Wrong password")
 
-# ─── Config File Helpers ─────────────────────────────────
+# ─── Config Helpers ──────────────────────────────────────
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -241,17 +428,16 @@ def save_config(cfg):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(cfg, f)
 
-# ─── Main Application ────────────────────────────────────
+# ─── Main App ────────────────────────────────────────────
 def main_app():
     with st.sidebar:
         st.title("⚙️ Controls")
 
-        # Profile section – select or create user
+        # Profile
         st.subheader("👤 Profile")
         username = st.text_input("Username", value="hardik")
         if st.button("Set User"):
             st.session_state['user_id'] = get_or_create_user(username)
-            # Reset current session when user changes
             if 'current_session' in st.session_state:
                 del st.session_state['current_session']
             st.success(f"User set to: {username}")
@@ -271,7 +457,6 @@ def main_app():
             if hashlib.sha256(admin_pass.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
                 st.success("Admin access granted", icon="🔓")
 
-                # Telegram Bot control – only visible after correct admin password
                 st.subheader("📱 Telegram Bot")
                 config = load_config()
                 token_input = st.text_input(
@@ -305,7 +490,6 @@ def main_app():
 
                 st.divider()
 
-                # NVIDIA API key management – protected
                 st.subheader("🔑 NVIDIA API")
                 api_key_input = st.text_input(
                     "NVIDIA API Key",
@@ -325,7 +509,6 @@ def main_app():
 
         st.divider()
 
-        # Model selection (visible to all logged-in users)
         config = load_config()
         model = st.selectbox("Model", [
             "meta/llama3-70b-instruct",
@@ -334,7 +517,6 @@ def main_app():
             "google/gemma-7b-it"
         ], index=0)
 
-        # Persona selection – changes system prompt
         st.subheader("🎭 Persona")
         personas = {
             "Default Assistant": "You are a helpful, concise and friendly assistant.",
@@ -356,7 +538,6 @@ def main_app():
 
         st.divider()
 
-        # Sessions management – list, create, load, delete
         st.subheader("📁 Your Sessions")
 
         if st.button("➕ New Session"):
@@ -403,7 +584,6 @@ def main_app():
     # ─── Main Chat Area ──────────────────────────────────────
     st.title("🤖 NVIDIA AI Chat")
 
-    # Initialize new session if none exists
     if 'current_session' not in st.session_state:
         st.session_state['current_session'] = create_session(st.session_state['user_id'])
         st.session_state['messages'] = []
@@ -415,7 +595,6 @@ def main_app():
     if 'system_prompt' not in st.session_state:
         st.session_state['system_prompt'] = get_session_prompt(st.session_state['current_session'])
 
-    # System prompt editor
     with st.expander("System Prompt (edit if needed)"):
         prompt_edit = st.text_area("Prompt", value=st.session_state['system_prompt'], height=120)
         if st.button("Update Prompt"):
@@ -424,13 +603,53 @@ def main_app():
             st.success("System prompt updated")
             st.rerun()
 
-    # Display chat history
     for msg in st.session_state['messages']:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             st.caption(str(msg["timestamp"]))
 
-    # Chat input + response generation
+    # ─── Export Section: PDF & Markdown with improved PDF styling ──
+    if 'current_session' in st.session_state:
+        st.markdown("---")
+        st.subheader("Export / Download Session")
+
+        col_pdf, col_md = st.columns(2)
+
+        with col_pdf:
+            if st.button("📄 Download as Styled PDF", use_container_width=True):
+                pdf_buffer = generate_session_pdf_bytes(st.session_state['current_session'])
+
+                session_title = supabase.table("sessions").select("title").eq("id", st.session_state['current_session']).single().execute().data['title']
+                safe_title = (session_title or "Chat_Session").replace(" ", "_").replace("/", "-")[:50]
+                filename = f"{safe_title}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+
+                st.download_button(
+                    label="Click to download PDF",
+                    data=pdf_buffer,
+                    file_name=filename,
+                    mime="application/pdf",
+                    key="download_pdf_styled"
+                )
+                st.success(f"Styled PDF ready: {filename}")
+
+        with col_md:
+            if st.button("📝 Download as Markdown (.md)", use_container_width=True):
+                md_content = generate_session_markdown(st.session_state['current_session'])
+
+                session_title = supabase.table("sessions").select("title").eq("id", st.session_state['current_session']).single().execute().data['title']
+                safe_title = (session_title or "Chat_Session").replace(" ", "_").replace("/", "-")[:50]
+                filename = f"{safe_title}_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+
+                st.download_button(
+                    label="Click to download .md",
+                    data=md_content,
+                    file_name=filename,
+                    mime="text/markdown",
+                    key="download_md"
+                )
+                st.success(f"Markdown ready: {filename}")
+
+    # ─── Chat Input + Response Generation ────────────────────
     if prompt := st.chat_input("Message..."):
         if not config.get('api_key'):
             st.error("NVIDIA API key not set (admin section)")
@@ -441,12 +660,11 @@ def main_app():
             save_message(st.session_state['current_session'], 'user', prompt)
             st.session_state['messages'] = load_messages(st.session_state['current_session'])
 
-            # ── Simple title after FIRST user message ──
             if len(st.session_state['messages']) == 1:
                 simple_title = auto_generate_simple_title(st.session_state['current_session'])
                 if simple_title:
                     st.toast(f"Session titled: {simple_title}", icon="✨")
-                    st.session_state['messages'] = load_messages(st.session_state['current_session'])  # refresh
+                    st.session_state['messages'] = load_messages(st.session_state['current_session'])
 
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
@@ -461,7 +679,6 @@ def main_app():
 
                         save_message(st.session_state['current_session'], 'assistant', response)
 
-                        # ── LLM-based better title after assistant reply ──
                         if len(st.session_state['messages']) >= 4 and config.get('api_key'):
                             llm_title = auto_generate_llm_title(
                                 st.session_state['current_session'],
